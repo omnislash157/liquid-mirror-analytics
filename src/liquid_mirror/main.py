@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .routes import analytics_router
 from .ingest import ingest_router
+from .otlp import otlp_router
 from .service import get_analytics_service
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ app.add_middleware(
 # Mount routes
 app.include_router(analytics_router, prefix="/api/analytics", tags=["Analytics"])
 app.include_router(ingest_router, prefix="/api/v1/ingest", tags=["Ingest"])
+app.include_router(otlp_router, tags=["OTLP"])  # Standard OTLP endpoints at /v1/traces, /v1/metrics, /v1/logs
 
 
 # =============================================================================
@@ -98,7 +100,12 @@ def root():
         "endpoints": {
             "ingest": "/api/v1/ingest/query",
             "analytics": "/api/analytics/dashboard",
-            "mirror": "/api/mirror/insights"
+            "mirror": "/api/mirror/insights",
+            "otlp": {
+                "traces": "/v1/traces",
+                "metrics": "/v1/metrics",
+                "logs": "/v1/logs"
+            }
         }
     }
 
