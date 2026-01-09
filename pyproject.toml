@@ -26,6 +26,7 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",
     "numpy>=1.24.0",
+    "fastapi>=0.100.0",
 ]
 
 [project.optional-dependencies]
@@ -40,8 +41,14 @@ dev = [
 Homepage = "https://github.com/mhartigan/liquid-mirror-analytics"
 Repository = "https://github.com/mhartigan/liquid-mirror-analytics"
 
+[tool.hatch.build.targets.sdist]
+include = ["src/liquid_mirror"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/liquid_mirror"]
+
+[tool.hatch.build]
+sources = ["src"]
 
 [tool.black]
 line-length = 88

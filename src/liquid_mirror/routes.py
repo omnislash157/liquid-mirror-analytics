@@ -212,6 +212,68 @@ def get_full_dashboard(
         }
 
 # =============================================================================
+# ERROR ANALYTICS (Phase 4: Hardening Integration)
+# =============================================================================
+
+@analytics_router.get("/errors/summary")
+def get_error_summary(
+    user: User = Depends(get_admin_user),
+    hours: int = Query(24, ge=1, le=168),
+):
+    """Get error summary for dashboard."""
+    try:
+        from .service import get_analytics_service
+        analytics = get_analytics_service()
+        return analytics.get_error_summary(hours=hours)
+    except Exception as e:
+        logger.error(f"Error fetching error summary: {e}")
+        return {
+            "total_errors": 0,
+            "affected_users": 0,
+            "affected_endpoints": 0,
+            "server_error_rate": 0,
+            "period_hours": hours,
+            "error": "Failed to fetch error summary"
+        }
+
+
+@analytics_router.get("/errors/by-endpoint")
+def get_errors_by_endpoint(
+    user: User = Depends(get_admin_user),
+    hours: int = Query(24, ge=1, le=168),
+):
+    """Get error breakdown by endpoint."""
+    try:
+        from .service import get_analytics_service
+        analytics = get_analytics_service()
+        return {
+            "period_hours": hours,
+            "data": analytics.get_errors_by_endpoint(hours=hours)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching errors by endpoint: {e}")
+        return {"period_hours": hours, "data": [], "error": "Failed to fetch errors"}
+
+
+@analytics_router.get("/errors/by-type")
+def get_errors_by_type(
+    user: User = Depends(get_admin_user),
+    hours: int = Query(24, ge=1, le=168),
+):
+    """Get error breakdown by exception type."""
+    try:
+        from .service import get_analytics_service
+        analytics = get_analytics_service()
+        return {
+            "period_hours": hours,
+            "data": analytics.get_errors_by_type(hours=hours)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching errors by type: {e}")
+        return {"period_hours": hours, "data": [], "error": "Failed to fetch errors"}
+
+
+# =============================================================================
 # STUB ENDPOINTS - Return empty data for removed features
 # These prevent 404s from old frontend builds still calling these endpoints
 # =============================================================================

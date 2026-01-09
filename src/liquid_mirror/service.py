@@ -65,11 +65,12 @@ def get_pool() -> ThreadedConnectionPool:
     """Get or create the connection pool."""
     global _pool
     if _pool is None:
+        db_config = get_db_config()
         logger.info("[POOL] Creating connection pool (min=2, max=10)")
         _pool = ThreadedConnectionPool(
             minconn=2,
             maxconn=10,
-            **DB_CONFIG
+            **db_config
         )
         atexit.register(_close_pool)
     return _pool
@@ -100,14 +101,44 @@ def timed(func):
 # DATABASE CONFIG
 # =============================================================================
 
-DB_CONFIG = {
-    "user": os.getenv("AZURE_PG_USER", "mhartigan"),
-    "password": os.getenv("AZURE_PG_PASSWORD", "Lalamoney3!"),
-    "host": os.getenv("AZURE_PG_HOST", "cogtwin.postgres.database.azure.com"),
-    "port": int(os.getenv("AZURE_PG_PORT", "5432")),
-    "database": os.getenv("AZURE_PG_DATABASE", "postgres"),
-    "sslmode": "require"
-}
+def get_db_config() -> dict:
+    """
+    Get database config, preferring AZURE_PG_CONNECTION_STRING (Railway pattern).
+    Falls back to individual env vars for local dev.
+    """
+    import urllib.parse
+
+    conn_string = os.getenv("AZURE_PG_CONNECTION_STRING")
+    if conn_string:
+        parsed = urllib.parse.urlparse(conn_string)
+        return {
+            "user": parsed.username,
+            "password": urllib.parse.unquote(parsed.password or ""),
+            "host": parsed.hostname,
+            "port": parsed.port or 5432,
+            "database": parsed.path.lstrip("/"),
+            "sslmode": "require"
+        }
+
+    # Fallback to individual env vars (local dev)
+    pg_user = os.getenv("AZURE_PG_USER")
+    pg_password = os.getenv("AZURE_PG_PASSWORD")
+    pg_host = os.getenv("AZURE_PG_HOST")
+
+    if not all([pg_user, pg_password, pg_host]):
+        raise RuntimeError(
+            "Database not configured. Set AZURE_PG_CONNECTION_STRING or "
+            "individual AZURE_PG_USER, AZURE_PG_PASSWORD, AZURE_PG_HOST vars."
+        )
+
+    return {
+        "user": pg_user,
+        "password": pg_password,
+        "host": pg_host,
+        "port": int(os.getenv("AZURE_PG_PORT", "5432")),
+        "database": os.getenv("AZURE_PG_DATABASE", "postgres"),
+        "sslmode": "require"
+    }
 
 SCHEMA = "enterprise"
 
@@ -1107,6 +1138,82 @@ class AnalyticsService:
                     result[level] = 0
 
             return result
+
+    # -------------------------------------------------------------------------
+    # ERROR ANALYTICS (Phase 4: Hardening Integration)
+    # -------------------------------------------------------------------------
+
+    @timed
+    def get_error_summary(self, hours: int = 24) -> Dict[str, Any]:
+        """Get error metrics for dashboard."""
+        with self._get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    COUNT(*) as total_errors,
+                    COUNT(DISTINCT user_email) as affected_users,
+                    COUNT(DISTINCT event_data->>'endpoint') as affected_endpoints,
+                    AVG(CASE WHEN (event_data->>'status_code')::int >= 500 THEN 1.0 ELSE 0.0 END) as server_error_rate
+                FROM {SCHEMA}.analytics_events
+                WHERE event_type = 'error'
+                AND created_at > NOW() - INTERVAL '1 hour' * %s
+            """, (hours,))
+            row = cur.fetchone()
+            return {
+                "total_errors": row['total_errors'] or 0,
+                "affected_users": row['affected_users'] or 0,
+                "affected_endpoints": row['affected_endpoints'] or 0,
+                "server_error_rate": round((row['server_error_rate'] or 0) * 100, 2),
+                "period_hours": hours
+            }
+
+    @timed
+    def get_errors_by_endpoint(self, hours: int = 24, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get error counts grouped by endpoint."""
+        with self._get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    event_data->>'endpoint' as endpoint,
+                    event_data->>'method' as method,
+                    COUNT(*) as error_count,
+                    COUNT(DISTINCT user_email) as affected_users,
+                    array_agg(DISTINCT error_type) as error_types
+                FROM {SCHEMA}.analytics_events
+                WHERE event_type = 'error'
+                AND created_at > NOW() - INTERVAL '1 hour' * %s
+                GROUP BY event_data->>'endpoint', event_data->>'method'
+                ORDER BY error_count DESC
+                LIMIT %s
+            """, (hours, limit))
+            return [{
+                "endpoint": row['endpoint'],
+                "method": row['method'],
+                "error_count": row['error_count'],
+                "affected_users": row['affected_users'],
+                "error_types": row['error_types'] or []
+            } for row in cur.fetchall()]
+
+    @timed
+    def get_errors_by_type(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get error counts grouped by exception type."""
+        with self._get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    error_type,
+                    COUNT(*) as count,
+                    COUNT(DISTINCT user_email) as affected_users,
+                    array_agg(DISTINCT event_data->>'endpoint') as endpoints
+                FROM {SCHEMA}.analytics_events
+                WHERE event_type = 'error'
+                AND created_at > NOW() - INTERVAL '1 hour' * %s
+                GROUP BY error_type
+                ORDER BY count DESC
+            """, (hours,))
+            return [{
+                "error_type": row['error_type'],
+                "count": row['count'],
+                "affected_users": row['affected_users'],
+                "endpoints": row['endpoints'] or []
+            } for row in cur.fetchall()]
 
     # -------------------------------------------------------------------------
     # DEBUG HELPERS
