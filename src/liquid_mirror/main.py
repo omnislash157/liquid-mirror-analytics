@@ -1,9 +1,10 @@
 """
 Liquid Mirror Analytics - FastAPI Application
 
-Standalone analytics service with:
-- Analytics dashboard API (/api/analytics/*)
-- Metacognitive mirror API (/api/mirror/*)
+Multi-tenant AI observability platform with:
+- Ingest API (/api/v1/ingest/*) - API key authenticated event ingestion
+- Analytics dashboard API (/api/analytics/*) - Dashboard queries
+- Metacognitive mirror API (/api/mirror/*) - Cognitive analysis
 - Health checks
 
 Deploy as separate Railway service or run locally:
@@ -19,6 +20,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .routes import analytics_router
+from .ingest import ingest_router
 from .service import get_analytics_service
 
 logger = logging.getLogger(__name__)
@@ -66,8 +68,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount analytics routes
+# Mount routes
 app.include_router(analytics_router, prefix="/api/analytics", tags=["Analytics"])
+app.include_router(ingest_router, prefix="/api/v1/ingest", tags=["Ingest"])
 
 
 # =============================================================================
@@ -89,10 +92,14 @@ def root():
     """Root endpoint with service info."""
     return {
         "service": "Liquid Mirror Analytics",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "docs": "/docs",
         "health": "/health",
-        "analytics": "/api/analytics/dashboard"
+        "endpoints": {
+            "ingest": "/api/v1/ingest/query",
+            "analytics": "/api/analytics/dashboard",
+            "mirror": "/api/mirror/insights"
+        }
     }
 
 
