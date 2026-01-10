@@ -5,6 +5,7 @@ Multi-tenant AI observability platform with:
 - Ingest API (/api/v1/ingest/*) - API key authenticated event ingestion
 - Analytics dashboard API (/api/analytics/*) - Dashboard queries
 - Metacognitive mirror API (/api/mirror/*) - Cognitive analysis
+- OTLP receiver (/v1/traces, /v1/metrics, /v1/logs) - OpenTelemetry ingestion
 - Health checks
 
 Deploy as separate Railway service or run locally:
@@ -23,14 +24,14 @@ from .routes import analytics_router
 from .ingest import ingest_router
 from .otlp import otlp_router
 from .service import get_analytics_service
+from .logging_config import setup_logging
+
+# Configure structured logging (JSON in production, human-readable in dev)
+# Set LM_JSON_LOGS=false for development
+json_output = os.getenv("LM_JSON_LOGS", "true").lower() != "false"
+setup_logging(json_output=json_output)
 
 logger = logging.getLogger(__name__)
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 
 
 @asynccontextmanager
