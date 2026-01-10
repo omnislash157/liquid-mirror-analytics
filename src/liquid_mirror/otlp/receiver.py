@@ -10,6 +10,9 @@ All endpoints accept:
 - application/json (JSON-encoded OTLP)
 - application/x-protobuf (Protobuf-encoded OTLP) [not yet implemented]
 
+Authentication:
+- X-API-Key header required (same as /api/v1/ingest/* endpoints)
+
 Persistence:
 - Traces -> enterprise.traces + enterprise.trace_spans
 - Logs -> enterprise.structured_logs
@@ -21,9 +24,9 @@ import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Request, Response, HTTPException, Depends
+from fastapi import APIRouter, Request, Response, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from psycopg2.extras import RealDictCursor
 
@@ -46,6 +49,35 @@ def get_mapper() -> OTelMapper:
 
 
 # -----------------------------------------------------------------
+# TENANT AUTHENTICATION
+# -----------------------------------------------------------------
+
+
+def get_tenant_id(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
+    """
+    Validate API key and return tenant_id.
+
+    Uses same API key validation as ingest.py endpoints.
+    Returns tenant_id (UUID string) for use in persistence.
+    """
+    from ..ingest import validate_api_key
+
+    tenant = validate_api_key(x_api_key)
+
+    if not tenant:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired API key",
+            headers={"WWW-Authenticate": "API-Key"}
+        )
+
+    if "ingest" not in tenant.scopes:
+        raise HTTPException(status_code=403, detail="Missing 'ingest' scope")
+
+    return tenant.tenant_id
+
+
+# -----------------------------------------------------------------
 # TRACES ENDPOINT
 # -----------------------------------------------------------------
 
@@ -53,11 +85,13 @@ def get_mapper() -> OTelMapper:
 @router.post("/traces")
 async def receive_traces(
     request: Request,
+    tenant_id: str = Depends(get_tenant_id),
     mapper: OTelMapper = Depends(get_mapper),
 ) -> Response:
     """
     Receive OTLP trace data.
 
+    Requires X-API-Key header for tenant authentication.
     Accepts JSON or Protobuf encoded ExportTraceServiceRequest.
     Maps to enterprise.traces and enterprise.trace_spans.
     """
@@ -76,14 +110,15 @@ async def receive_traces(
         # Map to enterprise schema
         traces, spans = mapper.map_traces(resource_spans)
 
-        # Persist to database
-        await _persist_traces(traces, spans)
+        # Persist to database with tenant isolation
+        await _persist_traces(tenant_id, traces, spans)
 
         logger.info(
-            "Ingested %d traces, %d spans",
+            "[OTLP] Ingested %d traces, %d spans for tenant %s",
             len(traces),
             len(spans),
-            extra={"trace_count": len(traces), "span_count": len(spans)},
+            tenant_id,
+            extra={"trace_count": len(traces), "span_count": len(spans), "tenant_id": tenant_id},
         )
 
         return _success_response()
@@ -103,11 +138,13 @@ async def receive_traces(
 @router.post("/metrics")
 async def receive_metrics(
     request: Request,
+    tenant_id: str = Depends(get_tenant_id),
     mapper: OTelMapper = Depends(get_mapper),
 ) -> Response:
     """
     Receive OTLP metric data.
 
+    Requires X-API-Key header for tenant authentication.
     Routes to enterprise.request_metrics or enterprise.llm_call_metrics
     based on metric name patterns.
     """
@@ -126,13 +163,14 @@ async def receive_metrics(
         # Map to enterprise schema
         metrics = mapper.map_metrics(resource_metrics)
 
-        # Persist to database
-        await _persist_metrics(metrics)
+        # Persist to database with tenant isolation
+        await _persist_metrics(tenant_id, metrics)
 
         logger.info(
-            "Ingested %d metric data points",
+            "[OTLP] Ingested %d metric data points for tenant %s",
             len(metrics),
-            extra={"metric_count": len(metrics)},
+            tenant_id,
+            extra={"metric_count": len(metrics), "tenant_id": tenant_id},
         )
 
         return _success_response()
@@ -152,11 +190,13 @@ async def receive_metrics(
 @router.post("/logs")
 async def receive_logs(
     request: Request,
+    tenant_id: str = Depends(get_tenant_id),
     mapper: OTelMapper = Depends(get_mapper),
 ) -> Response:
     """
     Receive OTLP log data.
 
+    Requires X-API-Key header for tenant authentication.
     Maps to enterprise.structured_logs.
     """
     content_type = request.headers.get("content-type", "application/json")
@@ -174,13 +214,14 @@ async def receive_logs(
         # Map to enterprise schema
         logs = mapper.map_logs(resource_logs)
 
-        # Persist to database
-        await _persist_logs(logs)
+        # Persist to database with tenant isolation
+        await _persist_logs(tenant_id, logs)
 
         logger.info(
-            "Ingested %d log records",
+            "[OTLP] Ingested %d log records for tenant %s",
             len(logs),
-            extra={"log_count": len(logs)},
+            tenant_id,
+            extra={"log_count": len(logs), "tenant_id": tenant_id},
         )
 
         return _success_response()
@@ -214,8 +255,8 @@ def _get_connection():
 # -----------------------------------------------------------------
 
 
-def _persist_traces_sync(traces: List[MappedTrace], spans: List[MappedSpan]) -> None:
-    """Sync implementation for trace persistence."""
+def _persist_traces_sync(tenant_id: str, traces: List[MappedTrace], spans: List[MappedSpan]) -> None:
+    """Sync implementation for trace persistence with tenant isolation."""
     if not traces and not spans:
         return
 
@@ -225,16 +266,17 @@ def _persist_traces_sync(traces: List[MappedTrace], spans: List[MappedSpan]) -> 
             for trace in traces:
                 cur.execute("""
                     INSERT INTO enterprise.traces
-                    (trace_id, entry_point, endpoint, method, session_id,
+                    (tenant_id, trace_id, entry_point, endpoint, method, session_id,
                      user_email, department, start_time, end_time, duration_ms,
                      status, error_message, tags)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (trace_id) DO UPDATE SET
                         end_time = EXCLUDED.end_time,
                         duration_ms = EXCLUDED.duration_ms,
                         status = EXCLUDED.status,
                         error_message = EXCLUDED.error_message
                 """, (
+                    tenant_id,
                     trace.trace_id,
                     trace.entry_point,
                     trace.endpoint,
@@ -254,11 +296,12 @@ def _persist_traces_sync(traces: List[MappedTrace], spans: List[MappedSpan]) -> 
             for span in spans:
                 cur.execute("""
                     INSERT INTO enterprise.trace_spans
-                    (trace_id, span_id, parent_span_id, operation_name, service_name,
+                    (tenant_id, trace_id, span_id, parent_span_id, operation_name, service_name,
                      start_time, end_time, duration_ms, status, error_message, tags, logs)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                 """, (
+                    tenant_id,
                     span.trace_id,
                     span.span_id,
                     span.parent_span_id,
@@ -276,13 +319,13 @@ def _persist_traces_sync(traces: List[MappedTrace], spans: List[MappedSpan]) -> 
             conn.commit()
 
     logger.debug(
-        "[OTLP] Persisted %d traces, %d spans",
-        len(traces), len(spans)
+        "[OTLP] Persisted %d traces, %d spans for tenant %s",
+        len(traces), len(spans), tenant_id
     )
 
 
-def _persist_logs_sync(logs: List[MappedLog]) -> None:
-    """Sync implementation for log persistence."""
+def _persist_logs_sync(tenant_id: str, logs: List[MappedLog]) -> None:
+    """Sync implementation for log persistence with tenant isolation."""
     if not logs:
         return
 
@@ -291,11 +334,12 @@ def _persist_logs_sync(logs: List[MappedLog]) -> None:
             for log in logs:
                 cur.execute("""
                     INSERT INTO enterprise.structured_logs
-                    (timestamp, level, logger_name, message, trace_id, span_id,
+                    (tenant_id, timestamp, level, logger_name, message, trace_id, span_id,
                      user_email, department, session_id, endpoint, extra,
                      exception_type, exception_message, exception_traceback)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
+                    tenant_id,
                     log.timestamp,
                     log.level,
                     log.logger_name,
@@ -314,11 +358,11 @@ def _persist_logs_sync(logs: List[MappedLog]) -> None:
 
             conn.commit()
 
-    logger.debug("[OTLP] Persisted %d logs", len(logs))
+    logger.debug("[OTLP] Persisted %d logs for tenant %s", len(logs), tenant_id)
 
 
-def _persist_metrics_sync(metrics: List[MappedMetric]) -> None:
-    """Sync implementation for metrics persistence."""
+def _persist_metrics_sync(tenant_id: str, metrics: List[MappedMetric]) -> None:
+    """Sync implementation for metrics persistence with tenant isolation."""
     if not metrics:
         return
 
@@ -333,10 +377,11 @@ def _persist_metrics_sync(metrics: List[MappedMetric]) -> None:
                 attrs = m.attributes or {}
                 cur.execute("""
                     INSERT INTO enterprise.request_metrics
-                    (timestamp, endpoint, method, status_code, response_time_ms,
+                    (tenant_id, timestamp, endpoint, method, status_code, response_time_ms,
                      user_email, department, request_size_bytes, response_size_bytes, trace_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
+                    tenant_id,
                     m.timestamp,
                     attrs.get("http.route") or attrs.get("http.target"),
                     attrs.get("http.method") or attrs.get("http.request.method"),
@@ -354,10 +399,11 @@ def _persist_metrics_sync(metrics: List[MappedMetric]) -> None:
                 attrs = m.attributes or {}
                 cur.execute("""
                     INSERT INTO enterprise.llm_call_metrics
-                    (timestamp, model, provider, prompt_tokens, completion_tokens,
+                    (tenant_id, timestamp, model, provider, prompt_tokens, completion_tokens,
                      total_tokens, elapsed_ms, user_email, department, trace_id, success)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
+                    tenant_id,
                     m.timestamp,
                     attrs.get("llm.model") or attrs.get("gen_ai.request.model"),
                     attrs.get("llm.provider") or attrs.get("gen_ai.system"),
@@ -374,8 +420,8 @@ def _persist_metrics_sync(metrics: List[MappedMetric]) -> None:
             conn.commit()
 
     logger.debug(
-        "[OTLP] Persisted %d request metrics, %d LLM metrics",
-        len(request_metrics), len(llm_metrics)
+        "[OTLP] Persisted %d request metrics, %d LLM metrics for tenant %s",
+        len(request_metrics), len(llm_metrics), tenant_id
     )
 
 
@@ -384,22 +430,22 @@ def _persist_metrics_sync(metrics: List[MappedMetric]) -> None:
 # -----------------------------------------------------------------
 
 
-async def _persist_traces(traces: List[MappedTrace], spans: List[MappedSpan]) -> None:
+async def _persist_traces(tenant_id: str, traces: List[MappedTrace], spans: List[MappedSpan]) -> None:
     """Persist traces and spans to enterprise.traces and enterprise.trace_spans."""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _persist_traces_sync, traces, spans)
+    await loop.run_in_executor(_executor, _persist_traces_sync, tenant_id, traces, spans)
 
 
-async def _persist_logs(logs: List[MappedLog]) -> None:
+async def _persist_logs(tenant_id: str, logs: List[MappedLog]) -> None:
     """Persist logs to enterprise.structured_logs."""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _persist_logs_sync, logs)
+    await loop.run_in_executor(_executor, _persist_logs_sync, tenant_id, logs)
 
 
-async def _persist_metrics(metrics: List[MappedMetric]) -> None:
+async def _persist_metrics(tenant_id: str, metrics: List[MappedMetric]) -> None:
     """Persist metrics to enterprise.request_metrics or enterprise.llm_call_metrics."""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _persist_metrics_sync, metrics)
+    await loop.run_in_executor(_executor, _persist_metrics_sync, tenant_id, metrics)
 
 
 # -----------------------------------------------------------------
