@@ -46,10 +46,47 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[LiquidMirror] Analytics service init failed: {e}")
 
+    # Wire metacognitive mirror to event bus
+    try:
+        _setup_mirror_event_subscription()
+    except Exception as e:
+        logger.warning(f"[LiquidMirror] Mirror event subscription failed: {e}")
+
     yield
 
     # Cleanup
     logger.info("[LiquidMirror] Shutting down...")
+
+
+def _setup_mirror_event_subscription() -> None:
+    """Subscribe metacognitive mirror to event bus for cognitive tracking."""
+    import numpy as np
+    from .events import get_event_bus, EVENT_QUERY
+    from .mirror import QueryEvent
+
+    def handle_query_event(event) -> None:
+        """Bridge AnalyticsQueryEvent -> QueryEvent for mirror."""
+        try:
+            mirror = get_mirror()
+
+            # Convert AnalyticsQueryEvent to mirror's QueryEvent format
+            query_event = QueryEvent(
+                timestamp=event.timestamp,
+                query_text=event.query_text,
+                query_embedding=event.query_embedding if event.query_embedding is not None else np.zeros(1536, dtype=np.float32),
+                retrieved_memory_ids=event.retrieved_memory_ids or [],
+                retrieval_scores=event.retrieval_scores or [],
+                execution_time_ms=event.execution_time_ms,
+                result_count=event.result_count,
+                semantic_gate_passed=event.semantic_gate_passed,
+            )
+            mirror.record_query(query_event)
+        except Exception as e:
+            logger.error(f"[Mirror] Failed to process query event: {e}")
+
+    bus = get_event_bus()
+    bus.subscribe(EVENT_QUERY, handle_query_event)
+    logger.info("[LiquidMirror] MetacognitiveMirror subscribed to EVENT_QUERY")
 
 
 app = FastAPI(
