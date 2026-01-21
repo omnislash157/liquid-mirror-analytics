@@ -15,8 +15,12 @@ Authentication:
 
 Persistence:
 - Traces -> enterprise.traces + enterprise.trace_spans
-- Logs -> enterprise.structured_logs
+- Logs -> enterprise.structured_logs + MetacognitiveMirror (stream.ended events)
 - Metrics -> enterprise.request_metrics / enterprise.llm_call_metrics
+
+MetacognitiveMirror Integration:
+- When logs contain stream_operation=stream.ended, extract query data and feed to mirror
+- This bridges OTLP pipeline to cognitive analytics without EventBus
 """
 
 import json
@@ -24,8 +28,10 @@ import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import List, Optional
 
+import numpy as np
 from fastapi import APIRouter, Request, Response, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from psycopg2.extras import RealDictCursor
@@ -358,7 +364,77 @@ def _persist_logs_sync(tenant_id: str, logs: List[MappedLog]) -> None:
 
             conn.commit()
 
+    # Bridge to MetacognitiveMirror for cognitive analytics
+    _feed_mirror_from_logs(logs)
+
     logger.debug("[OTLP] Persisted %d logs for tenant %s", len(logs), tenant_id)
+
+
+def _feed_mirror_from_logs(logs: List[MappedLog]) -> None:
+    """
+    Bridge OTLP logs to MetacognitiveMirror.
+
+    Extracts query completion events from streaming tracer spans and feeds
+    them to the mirror for cognitive pattern analysis.
+
+    Triggered by: stream_operation=stream.ended logs from enterprise_bot
+    """
+    try:
+        from ..main import get_mirror
+        from ..mirror.metacognitive_mirror import QueryEvent as MirrorQueryEvent
+
+        mirror = get_mirror()
+        fed_count = 0
+
+        for log in logs:
+            extra = log.extra or {}
+            stream_op = extra.get("stream_operation")
+
+            # Only process stream.ended events (query completion)
+            if stream_op != "stream.ended":
+                continue
+
+            # Extract query data from streaming tracer attributes
+            # These come from streaming_tracer.py span() calls
+            query_text = extra.get("stream_attr_query_text", "")
+            response_length = extra.get("stream_attr_response_length", 0)
+            total_chunks = extra.get("stream_attr_total_chunks", 0)
+
+            # If no query text in this log, try to reconstruct from session context
+            # The query text is typically in the stream.started event, not stream.ended
+            # For now, use a placeholder - full reconstruction would require querying recent logs
+            if not query_text:
+                query_text = f"[session:{log.session_id}]"
+
+            # Create a zero embedding (MetacognitiveMirror will still track patterns)
+            # In production, you'd want to compute embeddings server-side or pass from enterprise_bot
+            zero_embedding = np.zeros(1536, dtype=np.float32)
+
+            # Build mirror event
+            mirror_event = MirrorQueryEvent(
+                timestamp=log.timestamp,
+                query_text=query_text[:500],  # Truncate for safety
+                query_embedding=zero_embedding,
+                retrieved_memory_ids=[],  # Not available in streaming context
+                retrieval_scores=[],
+                execution_time_ms=extra.get("stream_attr_total_ms", 0.0),
+                result_count=0,
+                semantic_gate_passed=True,
+            )
+
+            # Feed to mirror
+            mirror.record_query(mirror_event)
+            fed_count += 1
+
+        if fed_count > 0:
+            logger.info(f"[OTLP->Mirror] Fed {fed_count} query events to MetacognitiveMirror")
+
+    except ImportError as e:
+        # Mirror not available - graceful degradation
+        logger.debug(f"[OTLP->Mirror] Mirror not available: {e}")
+    except Exception as e:
+        # Don't fail log persistence if mirror fails
+        logger.warning(f"[OTLP->Mirror] Failed to feed mirror: {e}")
 
 
 def _persist_metrics_sync(tenant_id: str, metrics: List[MappedMetric]) -> None:
